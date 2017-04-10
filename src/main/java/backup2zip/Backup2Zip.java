@@ -1,9 +1,13 @@
 package backup2zip;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.PrintStream;
+import java.math.BigInteger;
 import java.nio.file.Files;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -70,38 +74,54 @@ public class Backup2Zip {
             System.out.format("\"%s\" does not exist or is not a directory", targetDir.getCanonicalPath());
         }
         
-        final long now = Instant.now().toEpochMilli();
+        final File backupsDir = new File(targetDir, "backups");
+
         final String zipName;
         long incrementalTime;
         if (doFull) {
-            zipName = "backup.full." + now + ".zip";
+            zipName = "full";
             incrementalTime = 0;
         } else {
-            zipName = "backup.incr." + now + ".zip";
-            final int nameCount = targetDir.toPath().getNameCount(); 
-            final File[] backupFiles = targetDir.listFiles(file ->  
-                file.toPath().subpath(nameCount, nameCount + 1).toString().startsWith("backup."));
+            zipName = "incr";
+            final int nameCount = targetDir.toPath().getNameCount();
+            final File[] backupFiles = backupsDir.listFiles();
             if (backupFiles.length == 0) {
                 incrementalTime = 0;
             } else {
-                final List<String> backupFileNames = Arrays.asList(backupFiles).stream()
-                        .map(file -> file.toPath().subpath(nameCount, nameCount + 1).toString())
+                final List<Long> backupFileNames = Arrays.asList(backupFiles).stream()
+                        .map(file -> Long.parseLong(file.toPath().subpath(nameCount + 1, nameCount + 2).toString()
+                                .replace("incr", "")
+                                .replace("full", "")
+                                .replace(".zip", "")))
                         .collect(Collectors.toList());
-                final String backupFile = new TreeSet<String>(backupFileNames).descendingIterator().next();
-                incrementalTime = Long.parseLong(backupFile.substring(12, backupFile.length() - 4));
+                incrementalTime = new TreeSet<Long>(backupFileNames).descendingIterator().next();
             }
         }
         
-        final ZipFile zipFile = new ZipFile(new File(targetDir, zipName));
+        long now = Instant.now().toEpochMilli();
+        
+        final SecureRandom random = new SecureRandom();
+        final String password = new BigInteger(130, random).toString(32);
+        
+        final ZipFile zipFile = new ZipFile(new File(backupsDir, zipName + now + ".zip"));
         final ZipParameters parameters = new ZipParameters();
         parameters.setCompressionMethod(Zip4jConstants.COMP_DEFLATE);
         parameters.setCompressionLevel(Zip4jConstants.DEFLATE_LEVEL_NORMAL);
-
+        
+        parameters.setEncryptFiles(true);
+        parameters.setEncryptionMethod(Zip4jConstants.ENC_METHOD_AES);
+        parameters.setAesKeyStrength(Zip4jConstants.AES_STRENGTH_256);
+        parameters.setPassword(password);
         
         final Walk walk = new Walk(sourceTree, zipFile, parameters, incrementalTime);
-        walk.start();
+        List<File> results = walk.start();
         
-        
+        if (!results.isEmpty()) {
+            final File passwordFile = new File(targetDir, "passwords/pass" + now + ".txt");
+            try (PrintStream ps = new PrintStream(new FileOutputStream(passwordFile))) {
+                ps.println(password);
+            }
+        }
     }    
     
     public class Walk extends DirectoryWalker<File> {
@@ -118,9 +138,10 @@ public class Backup2Zip {
             this.incrementalTime = incrementalTime;
         }
 
-        public void start() throws IOException {
+        public List<File> start() throws IOException {
             List<File> results = new ArrayList<>();
             walk(startDirectory, results);
+            return results;
         }
 
         @Override
@@ -135,9 +156,9 @@ public class Backup2Zip {
 
             try {
                 BasicFileAttributes attr = Files.readAttributes(file.toPath(), BasicFileAttributes.class);
-
                 if (attr.creationTime().toMillis() > incrementalTime || attr.lastModifiedTime().toMillis() > incrementalTime) {
                     zipFile.addFile(file, parameters);
+                    results.add(file);
                 }
             } catch (ZipException | IOException e) {
                 throw new RuntimeException(e);
